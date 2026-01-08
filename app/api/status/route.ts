@@ -16,21 +16,18 @@ type PlayerRecord = {
   createdAt: string;
 };
 
-const playersKey = `r6:${TEAM_ID}:players`; // Redis Set of usernames
+const playersKey = `r6:${TEAM_ID}:players`;
 const playerDataKey = (u: string) => `r6:${TEAM_ID}:player:${u.toLowerCase()}`;
 
-// ----- Redis singleton (no global typing needed) -----
+// ---- Redis singleton ----
 let redisClient: RedisClientType | null = null;
 let connectPromise: Promise<RedisClientType> | null = null;
 
 function getRedis(): RedisClientType {
   if (!REDIS_URL) throw new Error("Missing REDIS_URL env var");
-
   if (!redisClient) {
     redisClient = createClient({ url: REDIS_URL });
-    redisClient.on("error", (err) => {
-      console.error("Redis Client Error", err);
-    });
+    redisClient.on("error", (err) => console.error("Redis Client Error", err));
   }
   return redisClient;
 }
@@ -41,27 +38,28 @@ async function ensureRedisConnected() {
 
   if (!connectPromise) {
     connectPromise = client.connect().finally(() => {
-      connectPromise = null; // allow retry if connect fails
+      connectPromise = null;
     });
   }
-
   await connectPromise;
 }
 
-// ----- Hashing helpers -----
+// ---- hashing ----
 function sha256(s: string) {
   return crypto.createHash("sha256").update(s).digest("hex");
 }
-
 function pinHash(username: string, pin: string) {
   return sha256(`${PIN_SALT}::${username.toLowerCase()}::${pin}`);
 }
-
 function adminPinHash(pin: string) {
   return sha256(`${PIN_SALT}::ADMIN::${pin}`);
 }
+function adminOk(inputPin: string) {
+  const expected = adminPinHash(ADMIN_PIN);
+  return adminPinHash(inputPin) === expected;
+}
 
-// ----- Data helpers -----
+// ---- helpers ----
 async function getPlayer(username: string): Promise<PlayerRecord | null> {
   await ensureRedisConnected();
   const client = getRedis();
@@ -90,60 +88,53 @@ async function getAllPlayersPublic(): Promise<PlayerPublic[]> {
       updatedAt: data?.updatedAt || "",
     });
   }
-
   return out;
 }
 
-// Public: list players + statuses (no pins)
+// Public: list players + statuses
 export async function GET() {
   try {
     const players = await getAllPlayersPublic();
     return Response.json({ ok: true, players });
   } catch (err: any) {
     console.error(err);
-    return Response.json(
-      { ok: false, error: err?.message || "Server error" },
-      { status: 500 }
-    );
+    return Response.json({ ok: false, error: err?.message || "Server error" }, { status: 500 });
   }
 }
 
 /**
- * POST action router:
- *  - { action: "update", username, pin, active }
- *  - { action: "add", adminPin, username, pin }   // pin optional -> auto generate
+ * POST actions:
+ *  - update: { action:"update", username, pin, active }
+ *  - add:    { action:"add", adminPin, username, pin? }
+ *  - remove: { action:"remove", adminPin, username }
  */
 export async function POST(req: Request) {
   try {
     if (!PIN_SALT) {
-      return Response.json(
-        { ok: false, error: "Server misconfigured (PIN_SALT missing)" },
-        { status: 500 }
-      );
+      return Response.json({ ok: false, error: "Server misconfigured (PIN_SALT missing)" }, { status: 500 });
     }
+    if (!ADMIN_PIN) {
+      return Response.json({ ok: false, error: "Server misconfigured (ADMIN_PIN missing)" }, { status: 500 });
+    }
+
+    await ensureRedisConnected();
+    const client = getRedis();
 
     const body = await req.json().catch(() => ({}));
     const action = String(body.action || "").trim();
 
-    // ---- Update player status (requires player PIN) ----
     if (action === "update") {
       const username = String(body.username || "").trim();
       const pin = String(body.pin || "").trim();
       const active = !!body.active;
 
       if (!username || !pin) {
-        return Response.json(
-          { ok: false, error: "Missing username or pin" },
-          { status: 400 }
-        );
+        return Response.json({ ok: false, error: "Missing username or pin" }, { status: 400 });
       }
 
       const data = await getPlayer(username);
       if (!data?.pinHash) {
-        return Response.json(
-          { ok: false, error: "Player not found" },
-          { status: 404 }
-        );
+        return Response.json({ ok: false, error: "Player not found" }, { status: 404 });
       }
 
       if (data.pinHash !== pinHash(username, pin)) {
@@ -151,56 +142,30 @@ export async function POST(req: Request) {
       }
 
       const updatedAt = new Date().toISOString();
-      const updatedRecord: PlayerRecord = { ...data, active, updatedAt };
-      await setPlayer(username, updatedRecord);
+      await setPlayer(username, { ...data, active, updatedAt });
 
       return Response.json({ ok: true, player: { username, active, updatedAt } });
     }
 
-    // ---- Add player (requires admin PIN) ----
     if (action === "add") {
       const adminPin = String(body.adminPin || "").trim();
       const username = String(body.username || "").trim();
       let pin = String(body.pin || "").trim();
 
-      if (!ADMIN_PIN) {
-        return Response.json(
-          { ok: false, error: "Server misconfigured (ADMIN_PIN missing)" },
-          { status: 500 }
-        );
-      }
-
       if (!adminPin || !username) {
-        return Response.json(
-          { ok: false, error: "Missing adminPin or username" },
-          { status: 400 }
-        );
+        return Response.json({ ok: false, error: "Missing adminPin or username" }, { status: 400 });
+      }
+      if (!adminOk(adminPin)) {
+        return Response.json({ ok: false, error: "Wrong admin PIN" }, { status: 401 });
       }
 
-      // Verify admin PIN
-      const expected = adminPinHash(ADMIN_PIN);
-      if (adminPinHash(adminPin) !== expected) {
-        return Response.json(
-          { ok: false, error: "Wrong admin PIN" },
-          { status: 401 }
-        );
-      }
+      if (!pin) pin = String(Math.floor(1000 + Math.random() * 9000));
 
-      // Auto-generate player pin if not provided (4-digit)
-      if (!pin) {
-        pin = String(Math.floor(1000 + Math.random() * 9000));
-      }
-
-      // Check existing
       const existing = await getPlayer(username);
       if (existing) {
-        return Response.json(
-          { ok: false, error: "Player already exists" },
-          { status: 409 }
-        );
+        return Response.json({ ok: false, error: "Player already exists" }, { status: 409 });
       }
 
-      // Create record
       const record: PlayerRecord = {
         username,
         pinHash: pinHash(username, pin),
@@ -209,21 +174,33 @@ export async function POST(req: Request) {
         createdAt: new Date().toISOString(),
       };
 
-      await ensureRedisConnected();
-      const client = getRedis();
       await client.sAdd(playersKey, username);
       await client.set(playerDataKey(username), JSON.stringify(record));
 
-      // Return the generated pin ONCE (share privately)
       return Response.json({ ok: true, username, pin });
+    }
+
+    if (action === "remove") {
+      const adminPin = String(body.adminPin || "").trim();
+      const username = String(body.username || "").trim();
+
+      if (!adminPin || !username) {
+        return Response.json({ ok: false, error: "Missing adminPin or username" }, { status: 400 });
+      }
+      if (!adminOk(adminPin)) {
+        return Response.json({ ok: false, error: "Wrong admin PIN" }, { status: 401 });
+      }
+
+      // remove from roster + delete record
+      await client.sRem(playersKey, username);
+      await client.del(playerDataKey(username));
+
+      return Response.json({ ok: true, removed: username });
     }
 
     return Response.json({ ok: false, error: "Invalid action" }, { status: 400 });
   } catch (err: any) {
     console.error(err);
-    return Response.json(
-      { ok: false, error: err?.message || "Server error" },
-      { status: 500 }
-    );
+    return Response.json({ ok: false, error: err?.message || "Server error" }, { status: 500 });
   }
 }

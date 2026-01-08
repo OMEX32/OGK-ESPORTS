@@ -19,17 +19,23 @@ export default function Page() {
   const [newPin, setNewPin] = useState("");
   const [createdPin, setCreatedPin] = useState<string | null>(null);
 
+  // remove form
+  const [removeAdminPin, setRemoveAdminPin] = useState("");
+  const [removeUsername, setRemoveUsername] = useState("");
+
+  async function safeJsonOrText(res: Response) {
+    try {
+      return await res.json();
+    } catch {
+      return { error: await res.text().catch(() => "Request failed") };
+    }
+  }
+
   async function load() {
     setInfo("Loading...");
     try {
       const res = await fetch("/api/status");
-      // Try JSON first; if not JSON, show text
-      let data: any = {};
-      try {
-        data = await res.json();
-      } catch {
-        data = { error: await res.text().catch(() => "Request failed") };
-      }
+      const data: any = await safeJsonOrText(res);
 
       if (!res.ok) {
         setInfo(data.error || "Load failed");
@@ -39,7 +45,6 @@ export default function Page() {
       const list: Player[] = data.players || [];
       setPlayers(list);
 
-      // keep selected player's current status in the toggle
       const found = list.find((p) => p.username === username);
       if (found) setActive(!!found.active);
 
@@ -53,11 +58,10 @@ export default function Page() {
     load();
   }, []);
 
-  // Improvement #1: when switching user, update active AND clear the PIN field
   useEffect(() => {
     const found = players.find((p) => p.username === username);
     if (found) setActive(!!found.active);
-    setPin(""); // clear pin when changing user
+    setPin(""); // clear pin on user switch
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [username]);
 
@@ -69,22 +73,10 @@ export default function Page() {
       const res = await fetch("/api/status", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "update",
-          username,
-          pin,
-          active,
-        }),
+        body: JSON.stringify({ action: "update", username, pin, active }),
       });
 
-      // Improvement #2: handle non-JSON errors too
-      let data: any = {};
-      try {
-        data = await res.json();
-      } catch {
-        data = { error: await res.text().catch(() => "Update failed") };
-      }
-
+      const data: any = await safeJsonOrText(res);
       if (!res.ok) {
         setInfo(data.error || "Update failed");
         return;
@@ -113,26 +105,48 @@ export default function Page() {
         }),
       });
 
-      // Improvement #2: handle non-JSON errors too
-      let data: any = {};
-      try {
-        data = await res.json();
-      } catch {
-        data = { error: await res.text().catch(() => "Add failed") };
-      }
-
+      const data: any = await safeJsonOrText(res);
       if (!res.ok) {
         setInfo(data.error || "Add failed");
         return;
       }
 
-      setCreatedPin(data.pin); // show the generated pin once
+      setCreatedPin(data.pin);
       setInfo(`Added ${data.username}`);
       setNewUsername("");
       setNewPin("");
       await load();
     } catch (e: any) {
       setInfo(e?.message || "Add failed");
+    }
+  }
+
+  async function submitRemove() {
+    setInfo("Removing player...");
+    setCreatedPin(null);
+
+    try {
+      const res = await fetch("/api/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "remove",
+          adminPin: removeAdminPin,
+          username: removeUsername,
+        }),
+      });
+
+      const data: any = await safeJsonOrText(res);
+      if (!res.ok) {
+        setInfo(data.error || "Remove failed");
+        return;
+      }
+
+      setInfo(`Removed ${data.removed}`);
+      setRemoveUsername("");
+      await load();
+    } catch (e: any) {
+      setInfo(e?.message || "Remove failed");
     }
   }
 
@@ -218,6 +232,42 @@ export default function Page() {
 
         <small style={{ display: "block", marginTop: 8, color: "#666" }}>
           If you leave “New player PIN” empty, it generates a random 4-digit PIN and shows it once.
+        </small>
+      </section>
+
+      <section style={{ marginTop: 16, padding: 14, border: "1px solid #ddd", borderRadius: 12 }}>
+        <h2 style={{ margin: "0 0 10px", fontSize: 16 }}>Remove a player (captain only)</h2>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+          <input
+            placeholder="Admin PIN"
+            value={removeAdminPin}
+            onChange={(e) => setRemoveAdminPin(e.target.value)}
+            style={inputStyle}
+            inputMode="numeric"
+          />
+
+          <select value={removeUsername} onChange={(e) => setRemoveUsername(e.target.value)} style={inputStyle}>
+            <option value="">Select player…</option>
+            {players.map((p) => (
+              <option key={p.username} value={p.username}>
+                {p.username}
+              </option>
+            ))}
+          </select>
+
+          <button
+            onClick={submitRemove}
+            style={{ ...btnStyle, width: "100%" }}
+            disabled={!removeAdminPin || !removeUsername}
+            title="This will delete the player and their PIN"
+          >
+            Remove
+          </button>
+        </div>
+
+        <small style={{ display: "block", marginTop: 8, color: "#666" }}>
+          This removes the player from the roster and deletes their saved PIN/status.
         </small>
       </section>
 
