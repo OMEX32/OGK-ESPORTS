@@ -245,7 +245,6 @@ const btnStyle: React.CSSProperties = {
   padding: "10px 12px",
   borderRadius: 10,
   border: "1px solid #ccc",
-  background: "#fff",
   cursor: "pointer",
 };
 
