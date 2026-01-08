@@ -21,76 +21,119 @@ export default function Page() {
 
   async function load() {
     setInfo("Loading...");
-    const res = await fetch("/api/status");
-    const data = await res.json();
-    const list: Player[] = data.players || [];
-    setPlayers(list);
+    try {
+      const res = await fetch("/api/status");
+      // Try JSON first; if not JSON, show text
+      let data: any = {};
+      try {
+        data = await res.json();
+      } catch {
+        data = { error: await res.text().catch(() => "Request failed") };
+      }
 
-    // keep selected player's current status in the toggle
-    const found = list.find(p => p.username === username);
-    if (found) setActive(!!found.active);
+      if (!res.ok) {
+        setInfo(data.error || "Load failed");
+        return;
+      }
 
-    setInfo(`Loaded ${list.length} players`);
+      const list: Player[] = data.players || [];
+      setPlayers(list);
+
+      // keep selected player's current status in the toggle
+      const found = list.find((p) => p.username === username);
+      if (found) setActive(!!found.active);
+
+      setInfo(`Loaded ${list.length} players`);
+    } catch (e: any) {
+      setInfo(e?.message || "Load failed");
+    }
   }
 
-  useEffect(() => { load(); }, []);
-
   useEffect(() => {
-    const found = players.find(p => p.username === username);
+    load();
+  }, []);
+
+  // Improvement #1: when switching user, update active AND clear the PIN field
+  useEffect(() => {
+    const found = players.find((p) => p.username === username);
     if (found) setActive(!!found.active);
-  }, [username]); // eslint-disable-line
+    setPin(""); // clear pin when changing user
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [username]);
 
   async function submitUpdate() {
     setInfo("Updating...");
     setCreatedPin(null);
 
-    const res = await fetch("/api/status", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action: "update",
-        username,
-        pin,
-        active
-      }),
-    });
+    try {
+      const res = await fetch("/api/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "update",
+          username,
+          pin,
+          active,
+        }),
+      });
 
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      setInfo(data.error || "Update failed");
-      return;
+      // Improvement #2: handle non-JSON errors too
+      let data: any = {};
+      try {
+        data = await res.json();
+      } catch {
+        data = { error: await res.text().catch(() => "Update failed") };
+      }
+
+      if (!res.ok) {
+        setInfo(data.error || "Update failed");
+        return;
+      }
+
+      setInfo(`Updated ${username}`);
+      await load();
+    } catch (e: any) {
+      setInfo(e?.message || "Update failed");
     }
-
-    setInfo(`Updated ${username}`);
-    await load();
   }
 
   async function submitAdd() {
     setInfo("Adding player...");
     setCreatedPin(null);
 
-    const res = await fetch("/api/status", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action: "add",
-        adminPin,
-        username: newUsername,
-        pin: newPin || undefined,
-      }),
-    });
+    try {
+      const res = await fetch("/api/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "add",
+          adminPin,
+          username: newUsername,
+          pin: newPin || undefined,
+        }),
+      });
 
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      setInfo(data.error || "Add failed");
-      return;
+      // Improvement #2: handle non-JSON errors too
+      let data: any = {};
+      try {
+        data = await res.json();
+      } catch {
+        data = { error: await res.text().catch(() => "Add failed") };
+      }
+
+      if (!res.ok) {
+        setInfo(data.error || "Add failed");
+        return;
+      }
+
+      setCreatedPin(data.pin); // show the generated pin once
+      setInfo(`Added ${data.username}`);
+      setNewUsername("");
+      setNewPin("");
+      await load();
+    } catch (e: any) {
+      setInfo(e?.message || "Add failed");
     }
-
-    setCreatedPin(data.pin); // show the generated pin once
-    setInfo(`Added ${data.username}`);
-    setNewUsername("");
-    setNewPin("");
-    await load();
   }
 
   return (
@@ -104,8 +147,10 @@ export default function Page() {
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
           <select value={username} onChange={(e) => setUsername(e.target.value)} style={inputStyle}>
             <option value="">Select your name…</option>
-            {players.map(p => (
-              <option key={p.username} value={p.username}>{p.username}</option>
+            {players.map((p) => (
+              <option key={p.username} value={p.username}>
+                {p.username}
+              </option>
             ))}
           </select>
 
@@ -178,12 +223,10 @@ export default function Page() {
 
       <section style={{ marginTop: 16 }}>
         <h2 style={{ margin: "0 0 10px", fontSize: 16 }}>Roster</h2>
-        {players.map(p => (
+        {players.map((p) => (
           <div key={p.username} style={rowStyle}>
             <div style={{ fontWeight: 700 }}>{p.username}</div>
-            <div style={{ justifySelf: "end" }}>
-              {p.active ? "✅ Active" : "⛔ Not active"}
-            </div>
+            <div style={{ justifySelf: "end" }}>{p.active ? "✅ Active" : "⛔ Not active"}</div>
           </div>
         ))}
       </section>

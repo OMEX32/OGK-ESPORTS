@@ -1,21 +1,59 @@
-import { kv } from "@vercel/kv";
+// app/api/status/route.ts
 import crypto from "crypto";
+import { createClient, type RedisClientType } from "redis";
 
 const TEAM_ID = process.env.TEAM_ID || "default";
 const PIN_SALT = process.env.PIN_SALT || "";
 const ADMIN_PIN = process.env.ADMIN_PIN || "";
+const REDIS_URL = process.env.REDIS_URL || "";
 
 type PlayerPublic = { username: string; active: boolean; updatedAt: string };
+type PlayerRecord = {
+  username: string;
+  pinHash: string;
+  active: boolean;
+  updatedAt: string;
+  createdAt: string;
+};
 
-const playersKey = `r6:${TEAM_ID}:players`; // set of usernames
+const playersKey = `r6:${TEAM_ID}:players`; // Redis Set of usernames
 const playerDataKey = (u: string) => `r6:${TEAM_ID}:player:${u.toLowerCase()}`;
 
+// ----- Redis singleton (no global typing needed) -----
+let redisClient: RedisClientType | null = null;
+let connectPromise: Promise<RedisClientType> | null = null;
+
+function getRedis(): RedisClientType {
+  if (!REDIS_URL) throw new Error("Missing REDIS_URL env var");
+
+  if (!redisClient) {
+    redisClient = createClient({ url: REDIS_URL });
+    redisClient.on("error", (err) => {
+      console.error("Redis Client Error", err);
+    });
+  }
+  return redisClient;
+}
+
+async function ensureRedisConnected() {
+  const client = getRedis();
+  if (client.isOpen) return;
+
+  if (!connectPromise) {
+    connectPromise = client.connect().finally(() => {
+      connectPromise = null; // allow retry if connect fails
+    });
+  }
+
+  await connectPromise;
+}
+
+// ----- Hashing helpers -----
 function sha256(s: string) {
   return crypto.createHash("sha256").update(s).digest("hex");
 }
 
 function pinHash(username: string, pin: string) {
-  // include username + salt to make reuse harder
   return sha256(`${PIN_SALT}::${username.toLowerCase()}::${pin}`);
 }
 
@@ -23,25 +61,51 @@ function adminPinHash(pin: string) {
   return sha256(`${PIN_SALT}::ADMIN::${pin}`);
 }
 
+// ----- Data helpers -----
+async function getPlayer(username: string): Promise<PlayerRecord | null> {
+  await ensureRedisConnected();
+  const client = getRedis();
+  const raw = await client.get(playerDataKey(username));
+  return raw ? (JSON.parse(raw) as PlayerRecord) : null;
+}
+
+async function setPlayer(username: string, record: PlayerRecord) {
+  await ensureRedisConnected();
+  const client = getRedis();
+  await client.set(playerDataKey(username), JSON.stringify(record));
+}
+
 async function getAllPlayersPublic(): Promise<PlayerPublic[]> {
-  const users = (await kv.smembers(playersKey)) as string[];
+  await ensureRedisConnected();
+  const client = getRedis();
+
+  const users = await client.sMembers(playersKey);
   const out: PlayerPublic[] = [];
 
   for (const username of users.sort((a, b) => a.localeCompare(b))) {
-    const data = (await kv.get(playerDataKey(username))) as any | null;
+    const data = await getPlayer(username);
     out.push({
       username,
       active: !!data?.active,
       updatedAt: data?.updatedAt || "",
     });
   }
+
   return out;
 }
 
 // Public: list players + statuses (no pins)
 export async function GET() {
-  const players = await getAllPlayersPublic();
-  return Response.json({ ok: true, players });
+  try {
+    const players = await getAllPlayersPublic();
+    return Response.json({ ok: true, players });
+  } catch (err: any) {
+    console.error(err);
+    return Response.json(
+      { ok: false, error: err?.message || "Server error" },
+      { status: 500 }
+    );
+  }
 }
 
 /**
@@ -50,76 +114,116 @@ export async function GET() {
  *  - { action: "add", adminPin, username, pin }   // pin optional -> auto generate
  */
 export async function POST(req: Request) {
-  const body = await req.json().catch(() => ({}));
-  const action = String(body.action || "").trim();
-
-  if (action === "update") {
-    const username = String(body.username || "").trim();
-    const pin = String(body.pin || "").trim();
-    const active = !!body.active;
-
-    if (!username || !pin) {
-      return Response.json({ ok: false, error: "Missing username or pin" }, { status: 400 });
+  try {
+    if (!PIN_SALT) {
+      return Response.json(
+        { ok: false, error: "Server misconfigured (PIN_SALT missing)" },
+        { status: 500 }
+      );
     }
 
-    const data = (await kv.get(playerDataKey(username))) as any | null;
-    if (!data?.pinHash) {
-      return Response.json({ ok: false, error: "Player not found" }, { status: 404 });
+    const body = await req.json().catch(() => ({}));
+    const action = String(body.action || "").trim();
+
+    // ---- Update player status (requires player PIN) ----
+    if (action === "update") {
+      const username = String(body.username || "").trim();
+      const pin = String(body.pin || "").trim();
+      const active = !!body.active;
+
+      if (!username || !pin) {
+        return Response.json(
+          { ok: false, error: "Missing username or pin" },
+          { status: 400 }
+        );
+      }
+
+      const data = await getPlayer(username);
+      if (!data?.pinHash) {
+        return Response.json(
+          { ok: false, error: "Player not found" },
+          { status: 404 }
+        );
+      }
+
+      if (data.pinHash !== pinHash(username, pin)) {
+        return Response.json({ ok: false, error: "Wrong PIN" }, { status: 401 });
+      }
+
+      const updatedAt = new Date().toISOString();
+      const updatedRecord: PlayerRecord = { ...data, active, updatedAt };
+      await setPlayer(username, updatedRecord);
+
+      return Response.json({ ok: true, player: { username, active, updatedAt } });
     }
 
-    const ok = data.pinHash === pinHash(username, pin);
-    if (!ok) {
-      return Response.json({ ok: false, error: "Wrong PIN" }, { status: 401 });
+    // ---- Add player (requires admin PIN) ----
+    if (action === "add") {
+      const adminPin = String(body.adminPin || "").trim();
+      const username = String(body.username || "").trim();
+      let pin = String(body.pin || "").trim();
+
+      if (!ADMIN_PIN) {
+        return Response.json(
+          { ok: false, error: "Server misconfigured (ADMIN_PIN missing)" },
+          { status: 500 }
+        );
+      }
+
+      if (!adminPin || !username) {
+        return Response.json(
+          { ok: false, error: "Missing adminPin or username" },
+          { status: 400 }
+        );
+      }
+
+      // Verify admin PIN
+      const expected = adminPinHash(ADMIN_PIN);
+      if (adminPinHash(adminPin) !== expected) {
+        return Response.json(
+          { ok: false, error: "Wrong admin PIN" },
+          { status: 401 }
+        );
+      }
+
+      // Auto-generate player pin if not provided (4-digit)
+      if (!pin) {
+        pin = String(Math.floor(1000 + Math.random() * 9000));
+      }
+
+      // Check existing
+      const existing = await getPlayer(username);
+      if (existing) {
+        return Response.json(
+          { ok: false, error: "Player already exists" },
+          { status: 409 }
+        );
+      }
+
+      // Create record
+      const record: PlayerRecord = {
+        username,
+        pinHash: pinHash(username, pin),
+        active: false,
+        updatedAt: "",
+        createdAt: new Date().toISOString(),
+      };
+
+      await ensureRedisConnected();
+      const client = getRedis();
+      await client.sAdd(playersKey, username);
+      await client.set(playerDataKey(username), JSON.stringify(record));
+
+      // Return the generated pin ONCE (share privately)
+      return Response.json({ ok: true, username, pin });
     }
 
-    const updatedAt = new Date().toISOString();
-    await kv.set(playerDataKey(username), { ...data, active, updatedAt });
-
-    return Response.json({ ok: true, player: { username, active, updatedAt } });
+    return Response.json({ ok: false, error: "Invalid action" }, { status: 400 });
+  } catch (err: any) {
+    console.error(err);
+    return Response.json(
+      { ok: false, error: err?.message || "Server error" },
+      { status: 500 }
+    );
   }
-
-  if (action === "add") {
-    const adminPin = String(body.adminPin || "").trim();
-    const username = String(body.username || "").trim();
-    let pin = String(body.pin || "").trim();
-
-    if (!ADMIN_PIN || !PIN_SALT) {
-      return Response.json({ ok: false, error: "Server misconfigured (missing env vars)" }, { status: 500 });
-    }
-    if (!adminPin || !username) {
-      return Response.json({ ok: false, error: "Missing adminPin or username" }, { status: 400 });
-    }
-
-    // verify admin pin
-    const expected = adminPinHash(ADMIN_PIN);
-    if (adminPinHash(adminPin) !== expected) {
-      return Response.json({ ok: false, error: "Wrong admin PIN" }, { status: 401 });
-    }
-
-    // auto-generate player pin if not provided (4-digit)
-    if (!pin) {
-      pin = String(Math.floor(1000 + Math.random() * 9000));
-    }
-
-    const existing = (await kv.get(playerDataKey(username))) as any | null;
-    if (existing) {
-      return Response.json({ ok: false, error: "Player already exists" }, { status: 409 });
-    }
-
-    const record = {
-      username,
-      pinHash: pinHash(username, pin),
-      active: false,
-      updatedAt: "",
-      createdAt: new Date().toISOString(),
-    };
-
-    await kv.sadd(playersKey, username);
-    await kv.set(playerDataKey(username), record);
-
-    // return the generated pin ONCE (so you can share it)
-    return Response.json({ ok: true, username, pin });
-  }
-
-  return Response.json({ ok: false, error: "Invalid action" }, { status: 400 });
 }
